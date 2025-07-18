@@ -1,0 +1,475 @@
+---
+title: "EDGE2 calculation for Global Birds - 11017 species"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+
+```{r}
+library(ape)          
+library(phylobase)   
+library(data.table) 
+library(ggsci)       
+library(dplyr)       
+library(ggplot2)   
+library(viridis)
+```
+
+
+```{r}
+##Load your input files (IUCN categories)##
+
+#Read Extinction Risk Data (IUCN data). The current version, v9 (https://datazone.birdlife.org/about-our-science/taxonomy), has been issued in October 2024, but the tree taxonomy follows Clements 2023, so we manually reconcile the two data-set to create 01_table_iucncat.csv for 11017 species.
+
+pext_data <- read.csv("data/v2023-HBWv9/01_table_iucncat.csv") 
+str (pext_data)
+
+#You can use the table() function in R to get the count of species for each IUCN_cat value.
+table(pext_data$IUCN_cat)
+
+iucn_counts <- as.data.frame(table(pext_data$IUCN_cat))
+names(iucn_counts) <- c("IUCN Red List Category", "Species Count")
+print(iucn_counts)
+
+#save it
+write.csv(iucn_counts, "Data/v2023-HBWv9/TableS2_IUCN_speciescounts_medianpext.csv")
+
+#species of interest
+species_in_pext <- pext_data$species
+
+#Load the csv with species counts and median pext for each IUCN category, using this fig/table in methodology
+iucncount <- read.csv("Data/v2023-HBWv9/TableS2_IUCN_speciescounts_medianpext.csv")
+str(iucncount)
+
+#Save the Table as a PNG
+library(gridExtra)
+library(grid)
+
+# Define the output file
+png("Figs/Fig12-IUCN_species_counts_table.png", 
+    width = 2400, height = 1800,  # Adjust dimensions for desired size
+    res = 300)
+
+# Create and save the table
+grid.table(iucncount)
+
+# Close the graphics device
+dev.off()
+```
+
+```{r}
+##Load your input tree file##
+
+#Read and Inspect Tree "For clades where only a single well-supported consensus phylogenetic tree containing all recognised species is available, ED2, and thus p, must still be calculated a large number of times to  adequately capture the uncertainty in p (100 < n ≤ 1000 to mirror approaches to capture phylogenetic uncertainty". So we must work with multi-phylo tree. dated_rand_sample_clements.tre <- dated taxon addition tree cloud, 100 topologies from the taxon addition treeset using random selections from the node dates age for each dated node calibration. First line is a header line containing the text "trees", followed by one newick tree per line.
+#Downloaded from https://github.com/McTavishLab/AvesData/blob/main/Tree_versions/Aves_1.2/Clements2023/dated_sample_2023.tre
+tree <- ape::read.tree("Data/tree/Clements2023_Aves1.3/dated_rand_sample_clements.tre")
+str(tree)
+
+# Initialize a list to store subset trees
+tree_subsets <- list()
+
+# Loop over each tree in the multiPhylo object
+for (i in 1:length(tree)) {
+  single_tree <- tree[[i]]
+  
+  # Check if single_tree is a phylo object
+  if (!inherits(single_tree, "phylo")) {
+    stop("Tree should be a phylo object.")
+  }
+  
+  # Subset the tree
+  tree_subset <- ape::drop.tip(single_tree, setdiff(single_tree$tip.label, species_in_pext))
+  
+# Store the subsetted tree in the list
+  tree_subsets[[i]] <- tree_subset
+}
+
+# Check the structure of the tree_subsets list
+print(class(tree_subsets))  # Should be "list"
+print(length(tree_subsets))  # Should be equal to the number of trees
+print(class(tree_subsets[[1]]))  # Should be "phylo" for valid elements
+
+# Save Subsetted Trees 
+# Define the folder where you want to save the trees
+output_folder <- "results/subset-trees-mctavish-aves1.3-11017tip"  # Update this to your desired path
+
+# Create the output folder if it doesn't exist
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+# Loop through each tree in tree_subsets and save it
+for (i in seq_along(tree_subsets)) {
+  output_file <- file.path(output_folder, paste0("tree_subset_", i, ".tre"))
+  ape::write.tree(tree_subsets[[i]], file = output_file)
+  print(paste("Saved Tree", i, "to", output_file))
+}
+
+# Read Subsetted Trees Back
+tree_files <- list.files("Result/subset-trees-mctavish-aves1.3-11017tip", full.names = TRUE)
+trees <- lapply(tree_files, read.tree)  # List of trees
+```
+
+
+```{r}
+####### GE2 calculation Formula #########
+#modified from https://github.com/rgumbs/EDGE2/ 
+
+# Define pext values, excluding the DD and EX category
+pext.vals <- data.frame(
+  rl.cat = rev(c("CR", "EN", "VU", "NT", "LC")),
+  pext   = rev(c(0.97, 0.97/2, 0.97/4, 0.97/8, 0.97/16))
+)
+
+# Function to calculate GE2 scores
+GE.2.calc <- function(pext) {
+  # Sample categories for LC to CR
+  iucn <- sample(1:5, size = 1e6, replace = TRUE)
+  data <- data.frame(species = 1:1e6, pext = pext$pext[iucn])
+  data <- data[order(data$pext), ]
+  data$rank <- seq_len(nrow(data))
+  
+  # Calculate the median rank for each category
+  rank     <- c(0, with(data, tapply(rank, pext, median)))
+  pext.tap <- c(0, pext$pext)
+  
+  # Fit the polynomial model
+  rank.sq  <- rank^2
+  rank.cub <- rank^3
+  rank.qu  <- rank^4
+  model    <- lm(pext.tap ~ rank + rank.sq + rank.cub + rank.qu)
+  
+  # Predict pext values
+  data$rank.sq  <- data$rank^2
+  data$rank.cub <- data$rank^3
+  data$rank.qu  <- data$rank^4
+  data$rank.pext <- predict(model, data)
+  
+  # Ensure pext values stay within [0.0001, 0.9999]
+  data$rank.pext[data$rank.pext <= 0] <- 0.0001
+  data$rank.pext[data$rank.pext >= 1] <- 0.9999
+  
+  # Create data frames for each IUCN category
+  pext.LC <- data.frame(RL.cat = "LC", pext = data$rank.pext[data$pext == pext.tap[2]])
+  pext.NT <- data.frame(RL.cat = "NT", pext = data$rank.pext[data$pext == pext.tap[3]])
+  pext.VU <- data.frame(RL.cat = "VU", pext = data$rank.pext[data$pext == pext.tap[4]])
+  pext.EN <- data.frame(RL.cat = "EN", pext = data$rank.pext[data$pext == pext.tap[5]])
+  pext.CR <- data.frame(RL.cat = "CR", pext = data$rank.pext[data$pext == pext.tap[6]])
+  
+  # Combine all categories into one data frame
+  pext.obj <- rbind(pext.CR, pext.EN, pext.VU, pext.NT, pext.LC)
+  
+  # Adjust pext values for each category to match target medians
+  pext.obj.sample <- NULL
+  for (i in unique(pext.obj$RL.cat)) {
+    a <- pext.obj$pext[pext.obj$RL.cat == i]
+    target_median <- pext$pext[pext$rl.cat == i]
+    
+    if (median(a) < target_median) {
+      while (median(a) < target_median) {
+        a <- a[-sample(1:length(a), 50, prob = rev(a))]
+      }
+    } else {
+      while (median(a) > target_median) {
+        a <- a[-sample(1:length(a), 50, prob = a)]
+      }
+    }
+    
+    pext.obj.sample <- rbind(pext.obj.sample, data.frame(RL.cat = i, pext = a))
+  }
+  
+  
+##For unassessed NE and DD species, p is drawn from the entire distribution completely at random under the assumption that, although we do not know where NE and DD species will be located along the curve, it must be at some point between 0 and 1, as with other extant species. Thus we generate highly uncertain scores for NE and DD species that have a median value equivalent to elevated extinction risk (VU) when taken over a large number of iterations
+  
+  # Set the target median for DD category
+  target_median_dd <- 0.232  # The desired median for the Data Deficient (DD) category
+  n <- 1e5  # Number of samples to generate for the DD category
+  
+  # Sample pext values from the entire existing distribution
+  dd_values <- sample(pext.obj$pext, size = n, replace = TRUE)
+  
+  # Sort the sampled values and calculate the current median
+  dd_values_sorted <- sort(dd_values)
+  current_median <- median(dd_values_sorted)
+  
+  # Calculate the shift required to align the current median with the target median
+  shift <- target_median_dd - current_median
+  
+  # Apply the shift and ensure all values remain within [0.0001, 0.9999]
+  dd_values_shifted <- dd_values_sorted + shift
+  dd_values_shifted[dd_values_shifted < 0.0001] <- 0.0001
+  dd_values_shifted[dd_values_shifted > 0.9999] <- 0.9999
+  
+  # Add the adjusted DD category pext values to the final data frame
+  pext.obj.sample <- rbind(
+    pext.obj.sample,
+    data.frame(RL.cat = "DD", pext = dd_values_shifted)
+  )
+  
+  # Add EX category with fixed pext = 1 to make the total 1,000,000
+  num_ex_values <- 1e6 - nrow(pext.obj.sample)
+  pext.obj.sample <- rbind(
+    pext.obj.sample,
+    data.frame(RL.cat = "EX", pext = rep(1, num_ex_values))
+  )
+  
+  # Return the updated data frame that now includes the DD and EX categories
+  return(pext.obj.sample)
+}
+
+# Generate the pext samples including DD and EX categories
+pext_sample <- GE.2.calc(pext.vals)
+
+#Cat-count
+table(pext_sample$RL.cat)
+
+# Modify the IUCN category names
+pext_sample_iucnmod <- pext_sample
+pext_sample_iucnmod$RL.cat <- factor(pext_sample_iucnmod$RL.cat, 
+                             levels = c("DD", "CR", "VU", "NT", "LC", "EN", "EX"),
+                             labels = c("DD/NE", "CR", "VU", "NT", "LC", "EN", "EX"))
+
+pext_sample_iucnmod <- pext_sample_iucnmod %>%
+  mutate(RL.cat = reorder(RL.cat, pext, median, .desc = TRUE))
+
+ggplot(pext_sample_iucnmod, aes(x = RL.cat, y = pext, fill = RL.cat)) +
+  geom_boxplot() +
+  labs(
+    title = "Boxplot of pext values (probabilities of extinction) for each IUCN Red List category",
+    x = "IUCN Red List Category",
+    y = "pext value (GE2)"
+  ) +
+  theme_minimal() +
+  scale_fill_viridis_d()  # Use discrete viridis palette and reverse colors
+ 
+```
+
+
+```{r}
+####### EDGE2 calculation Formula #########
+#modified from https://github.com/rgumbs/EDGE2/
+
+# Load required libraries
+library(phylobase)
+library(data.table)
+
+# Function to reorder pext according to tree tip labels
+into_order <- function(tree, pext) {
+  new_pext <- pext[match(tree$tip.label, pext$species), ]
+  return(new_pext)
+}
+
+# Function to reorder tree components
+reorder_tree <- function(tree, ordering) {
+  tree@edge.length <- tree@edge.length[ordering]
+  tree@edge <- tree@edge[ordering, ]
+  return(tree)
+}
+
+# EDGE2 Function
+EDGE2_mod <- function(tree, pext) {
+  
+  names(pext) <- c("species", "pext")
+  
+  N_species <- length(tree$tip.label)
+  N_nodes <- tree$Nnode
+  N_tot <- N_species + N_nodes
+  
+  # Ensure extinction probabilities are given in the same order as tree$tip.label
+  if (!identical(tree$tip.label, pext$species)) {
+    pext <- into_order(tree, pext)
+  }
+  
+  if (!inherits(tree, "phylo")) {
+    tree <- as(tree, "phylo")
+  }
+  
+  # Initialize data frames for results
+  tree_dat <- data.frame(Species = as.character(tree$tip.label),
+                         TBL = NA, 
+                         pext = pext$pext, ED = NA, EDGE = NA)
+  ePD.dat <- data.frame(PD = sum(tree$edge.length), ePDloss = NA)
+  
+  # Convert tree to phylo4 for edge operations
+  tree <- as(tree, "phylo4")
+  root <- rootNode(tree)
+  nodes <- c(root, descendants(tree, root, "all"))
+  
+  # Reorder tree components for easier access
+  ord <- order(nodes)
+  tree <- reorder_tree(tree, ord)
+  nodes <- nodes[ord]
+  
+  tree_dat$TBL <- tree@edge.length[1:N_species]
+  
+  node_data <- data.frame(Node = 1:N_tot, Pext = rep(1, N_tot), Edge_Sum = NA)
+  node_data[1:N_species, 2] <- pext[, 2]
+  
+  # Assign the product of its descendant tips to each node
+  for (i in c(1:length(tree@label), N_tot:(root + 1))) {         # for each node, beginning with tips
+    anc <- tree@edge[i, 1]                                   # find ancestor of node
+    node_data[anc, 2] <- node_data[anc, 2] * node_data[i, 2]   # multiply ancestor value by node "pext" 
+  }
+
+  # Multiply each edge length by the pext calculated above
+  for (i in 1:length(nodes)) {
+    tree@edge.length[i] <- tree@edge.length[i] * node_data[i, 2]
+  }
+  
+  # Check for root edge length
+  if (is.na(tree@edge.length[root])) {
+    tree@edge.length[root] <- 0
+  }
+  
+  node_data$Edge_Sum[root] <- tree@edge.length[root]
+  
+  # For each internal node, sum ancestral edge lengths
+  for (i in (root + 1):N_tot) {
+    ans <- tree@edge[i, 1]
+    node_data$Edge_Sum[i] <- node_data$Edge_Sum[ans] + tree@edge.length[i]
+  }
+  
+  # For each tip, sum ancestral edge lengths to find EDGE2 score
+  for (i in 1:N_species) {
+    ans <- tree@edge[i, 1]
+    tree_dat$EDGE[i] <- node_data$Edge_Sum[ans] + tree@edge.length[i]
+  }
+  
+  tree_dat$ED <- tree_dat$EDGE / tree_dat$pext
+  
+  # Reorder the tree for output
+  tree <- reorder_tree(tree, order(ord))
+  
+  tree <- as(tree, "phylo")
+  ePD.dat$ePDloss <- sum(tree$edge.length)
+  
+  edge.res <- list(tree_dat, tree, ePD.dat)
+  return(edge.res)
+}
+```
+
+
+```{r}
+# Convert the pext_data to a data.table for efficient data manipulation
+pext_data <- as.data.table(pext_data)
+
+# Define a function to sample pext values based on IUCN categories - taking care of NE, CR(PE), CR(PEW), EW
+sample_pext_values <- function(tree, pext_sample, pext_data) {
+    # Extract species (tip labels) from the tree and convert them to character format
+    species <- as.character(tree$tip.label)
+    
+    # Create a data frame to store the sampled pext values for each species
+    sampled_pext <- data.frame(species = species, pext = NA)
+
+    # Loop through each species in the tree's tip labels
+    for (i in seq_along(species)) {
+        current_species <- species[i]  # Get the current species
+        
+        # Retrieve the IUCN category for the current species from pext_data
+        iucn_cat <- pext_data$IUCN_cat[pext_data$species == current_species]
+        
+        # Check if a corresponding IUCN category was found
+        if (length(iucn_cat) == 0) {
+            # If no category is found, issue a warning and skip to the next species
+            warning(paste("No IUCN category found for species:", current_species))
+            next
+        }
+        
+        # Replace NE category with DD, since we did not add NE in our simulation, but it follows same logic as DD
+        if (iucn_cat == "NE") {
+            iucn_cat <- "DD"
+        }
+        
+        # Treat CR(PE), CR(PEW), and EW as CR
+        if (iucn_cat %in% c("CR(PE)", "CR(PEW)", "EW")) {
+            iucn_cat <- "CR"
+        }
+        
+        # Retrieve the pext values for the identified IUCN category from pext_sample
+        pext_values <- pext_sample$pext[pext_sample$RL.cat == iucn_cat]
+        
+        # Check if there are available pext values for the category before sampling
+        if (length(pext_values) > 0) {
+            # Sample one pext value randomly and assign it to the current species
+            sampled_pext$pext[i] <- sample(pext_values, 1)
+        } else {
+            # If no pext values are found for the IUCN category, assign NA
+            sampled_pext$pext[i] <- NA
+            # Issue a warning about the missing pext values for the species
+            warning(paste("No pext values found for IUCN category:", iucn_cat, "for species:", current_species))
+        }
+    }
+    
+    # Return the data frame containing sampled pext values for each species
+    return(sampled_pext)
+}
+
+# Initialize a list to store the results for each tree
+results_list <- list()
+
+# Loop over each tree in the list of trees
+for (i in 1:length(trees)) {
+    # Extract the current tree from the list
+    tree <- trees[[i]]
+    
+    # Sample pext values for the current tree using the custom function
+    sampled_pext <- sample_pext_values(tree, pext_sample, pext_data)
+    
+    # Calculate the EDGE2 scores using the sampled pext values for the tree
+    edge2_results <- EDGE2_mod(tree, sampled_pext)
+    
+    # Extract the data frame containing the EDGE2 metrics (e.g., ED, EDGE, TBL)
+    edge2_scores <- edge2_results[[1]]
+    
+    # Store the extracted scores in the results list for this tree
+    results_list[[i]] <- edge2_scores
+    
+    # Save the EDGE2 scores to a CSV file for this tree
+    write.csv(edge2_scores, 
+              file = paste0("Result/v2023_aves1.3/edge2_scores_tree_", i, ".csv"), 
+              row.names = FALSE)
+}
+```
+
+
+```{r}
+#To create a CSV file that stores the median ED, median EDGE, median pext, median TBL along with IQR values for each tip_label across the results from all 100 trees
+# Define the directory where the CSV files are saved
+result_dir <- "Result/v2023_aves1.3/"
+
+# Get a list of all the CSV file paths
+file_paths <- list.files(result_dir, pattern = "edge2_scores_tree_.*\\.csv", full.names = TRUE)
+
+# Read each CSV file into a list
+results_list <- lapply(file_paths, read.csv)
+
+# Combine all results into one data frame
+combined_results <- do.call(rbind, results_list)# Calculate median ED, EDGE, TBL, and pext for each tip_label
+
+# Calculate median and interquartile range for ED, EDGE, TBL, and pext
+summary_results <- combined_results %>%
+  group_by(Species) %>%
+  summarise(
+    median_ED = median(ED),
+    IQR_ED_25 = quantile(ED, 0.25),
+    IQR_ED_75 = quantile(ED, 0.75),
+    median_EDGE = median(EDGE),
+    IQR_EDGE_25 = quantile(EDGE, 0.25),
+    IQR_EDGE_75 = quantile(EDGE, 0.75),
+    median_TBL = median(TBL),
+    IQR_TBL_25 = quantile(TBL, 0.25),
+    IQR_TBL_75 = quantile(TBL, 0.75),
+    median_pext = median(pext),
+    IQR_pext_25 = quantile(pext, 0.25),
+    IQR_pext_75 = quantile(pext, 0.75)
+  ) %>%
+  rename(tip_label = Species)
+
+# Save median results to a CSV file
+write.csv(summary_results, file = "Result/v2023_aves1.3/Table_Median_IQR_EDGE2_scores_11017sp.csv", row.names = FALSE)
+```
+
+
