@@ -1,0 +1,142 @@
+---
+title: "01_Birdlife_data_exploration"
+author: "Archita Sharma"
+date: "2024-07-24"
+output: html_document
+---
+#load packages
+```{r load packages}
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(letsR)
+library(raster)
+library(terra)
+```
+
+## R Markdown
+
+##Citation for dataset - BirdLife International and Handbook of the Birds of the World (2024) Bird species distribution maps of the world. Version 2024.2. Available at http://datazone.birdlife.org/species/requestdis.
+```{r working with birdlife file}
+# Specify the file paths, I am using 2024 version OF BOTW (Birdlife distribution maps). These were clipped to India in QGIS. Then in QGIS, we segregated valid and invalid layers. Invalid layers were fixed using fix geometry. Again they were checked for validity. Finally, all valid layers were merged to get a final merged_clipped_to_india distribution dataset. To convert the species list to Clements 2023 taxonomy, we had to split and lump a few species maps. We also had to drop species for which we could not split the shapefile. Final India shapefile dataset should comprise of 1250 species.
+
+
+# Load the QGISsaved shapefile to verify its contents
+gdb_cropped <- st_read("Result/Spatial/BOTW_2024_IND/clipped_allsp_india_lumps_splits_manual_final_070425/clipped_allsp_india_lumps_splits_manual_final_070425.shp")
+
+# Inspect the structure of the resulting intersected shapefile
+str(gdb_cropped)
+
+# Check for duplicates
+dup_count <- nrow(gdb_cropped) - length(unique(gdb_cropped$sciname_tr))
+cat("Number of duplicate scientific names:", dup_count, "\n")
+
+# Extract unique scientific names
+sci_name_list <- unique(gdb_cropped$sciname_tr)
+
+# Convert to a data frame for saving
+sci_name_df <- data.frame(sci_name = sci_name_list)
+
+# Save to a CSV file-1250 SPECIES
+write.csv(sci_name_df, "Result/Table1.1-gdbcropped_BOTW-India_sci_name_list.csv", row.names = FALSE)
+
+# Print message
+cat("Scientific names saved to 'sci_name_list.csv'\n")
+```
+
+
+```{r creating 10kmx10km grids}
+# Specify the file path for India's shapefile
+india_shapefile <- "Spatial/india_country_outline.shp"
+
+# Read the shapefile into an `sf` object
+india_shape <- st_read(india_shapefile)
+
+# Define the bounding box for the India shapefile
+# This creates a rectangular extent around the boundaries of `india_shape`
+extent_india <- st_bbox(india_shape)
+
+# Convert the bounding box to a raster extent
+# This allows creating a raster layer that covers the bounding box
+r_ext <- extent(extent_india)
+
+# Define the resolution for a 10 km x 10 km grid
+# 10 km approximately equals 0.1 degrees (adjust if using a projected CRS)
+res_km <- 0.1  
+
+# Create an empty raster with the specified resolution and extent
+# The raster serves as a base for generating a grid
+grid_raster <- raster(r_ext, res = res_km)
+
+# Convert the raster to a polygon grid (as an `sf` object)
+# Each grid cell is represented as a polygon
+grid_sf <- st_as_sf(rasterToPolygons(grid_raster))
+
+# Assign the same Coordinate Reference System (CRS) to the grid as the India shapefile
+# Ensures spatial compatibility for further operations
+st_crs(grid_sf) <- st_crs(india_shape)
+
+# Crop the grid to the boundary of the India shapefile
+# Retains only the grid cells that intersect with India's boundary
+grid_sf_cropped <- st_intersection(grid_sf, india_shape)
+
+# Compute the centroids for each grid cell
+grid_sf_cropped$centroid <- st_centroid(grid_sf_cropped$geometry)
+
+# Extract the X (longitude) and Y (latitude) coordinates of the centroids
+grid_sf_cropped$X <- st_coordinates(grid_sf_cropped$centroid)[, 1]  # Longitude
+grid_sf_cropped$Y <- st_coordinates(grid_sf_cropped$centroid)[, 2]  # Latitude
+
+# Save the cropped grid with centroids as a shapefile for further use
+st_write(grid_sf_cropped, "Result/10km_grid_india_with_centroids.shp", driver = "ESRI Shapefile")
+
+# Plot the grid and the India boundary to visually verify the output
+# The grid is displayed in blue, and the India boundary in red
+plot(st_geometry(grid_sf_cropped), col = NA, border = "blue", main = "10 km x 10 km Grid over India")
+plot(st_geometry(india_shape), add = TRUE, col = NA, border = "red")
+```
+
+```{r pam-using-letsR}
+# Load the shapefiles for the grid and intersected shapes
+grid <- vect("./Result/10km_grid_india_with_centroids.shp")  # Load the 10 km x 10 km grid as a SpatVector
+shapes <- vect("./Spatial/BOTW_2024_India/Archita_edge/clipped_allsp_india_lumps_splits_manual_final_020425.shp")  # Load the intersected species distribution shapefile as a SpatVector
+
+# Rename 'sci_nam' to 'SCINAME' in your shapes file
+names(shapes)[names(shapes) == "sciname_tr"] <- "SCINAME"
+
+# View the attribute tables of the loaded shapefiles
+# Displays information about the structure and attributes of the layers
+print(shapes)  # Prints the attribute table for the `shapes` layer
+print(grid)    # Prints the attribute table for the `grid` layer
+
+# View the attribute names of each layer
+names(shapes)  # Lists the column names (attributes) in the `shapes` layer
+names(grid)    # Lists the column names (attributes) in the `grid` layer
+
+# Add a unique ID to each grid cell
+# This ensures each grid cell has a distinct identifier for analysis
+grid$ID <- 1:nrow(grid)  # Create a sequential ID column in the grid layer
+
+# Extract the coordinates (X and Y) from the grid
+grid_coords <- grid[, c("X", "Y")]  # Select the columns containing X and Y
+
+# Use the lets.presab.grid function from the letsR package
+# This function generates a Presence-Absence Matrix (PAM) for species within the grid cells
+# Parameters:
+# - shapes: The species distribution layer (polygons or points)
+# - grid: The grid layer to aggregate species distributions
+# - sample.unit: The unique ID column in the grid layer
+#Following code took a day (less than 24 hours) to run on Ubuntu WS
+z <- lets.presab.grid(shapes = shapes, grid = grid, sample.unit = "ID")
+
+#Convert z to a Data Frame (if necessary)
+z_df <- as.data.frame(z$PAM)
+
+# Combine the coordinates with the resulting PAM matrix
+z_with_coords <- cbind(grid_coords, z_df)  # Add coordinates to the PAM matrix
+
+# Save the resulting PAM (Presence-Absence Matrix) to a CSV file
+# The PAM contains grid cells as rows and species as columns, with 1 indicating presence and 0 absence
+write.csv(z_with_coords, "Result/Table-PAMmatrix-India-Birdlife2024-2050sp_1.7_10Km.csv")
+```
+
